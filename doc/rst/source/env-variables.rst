@@ -2148,7 +2148,7 @@ Profiling
 #########
 
 CCL_ITT_LEVEL
-*************
+-------------
 
 **Syntax**
 
@@ -2174,10 +2174,10 @@ CCL_ITT_LEVEL
 
 Set this environment variable to specify Intel\ |reg|\  Instrumentation and Tracing Technology (ITT) profiling level.
 Once the environment variable is enabled (`value>0`), it is possible to collect and display profiling
-data for |product_short| using tools such as Intel\ |reg|\  VTune\ |tm|\  Profiler and `Unified Tracing and Profiling Tool <https://github.com/intel/pti-gpu/tree/master/tools/unitrace>`_.
+data for |product_short| using tools such as Intel\ |reg|\  VTune\ |tm|\  Profiler and `Unified Tracing and Profiling Tool<https://github.com/intel/pti-gpu/tree/master/tools/unitrace>_`.
 
 CCL_PROFILING_ENABLE 
-********************
+---------------------
 
 **Syntax**
 

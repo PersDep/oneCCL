@@ -663,13 +663,19 @@ void env_data::parse() {
         if (ccl_root.empty()) {
             // CCL_ROOT and ONEAPI_ROOT are missing
             Dl_info info;
+
             if (dladdr((void*)ccl::get_library_version, &info)) {
                 char libccl_path[PATH_MAX];
-                std::strncpy(libccl_path, info.dli_fname, PATH_MAX - 1);
-                libccl_path[PATH_MAX - 1] = '\0';
 
-                char* libccl_dir = dirname(libccl_path);
-                ccl_root = dirname(libccl_dir);
+                if (realpath(info.dli_fname, libccl_path) != nullptr) {
+                    // We have to use `realpath`, so the dirname will work correctly
+                    libccl_path[PATH_MAX - 1] = '\0';
+
+                    char* libccl_dir = dirname(libccl_path);
+                    char* ccl_root_cstr = dirname(libccl_dir);
+
+                    ccl_root = std::string(ccl_root_cstr);
+                }
             }
         }
 
