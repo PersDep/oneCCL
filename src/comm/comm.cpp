@@ -37,6 +37,19 @@
 #include "common/utils/sycl_utils.hpp"
 #endif // CCL_ENABLE_SYCL
 
+namespace ccl {
+namespace v1 {
+
+struct impl_dispatch {
+    template <class Object>
+    const typename Object::impl_value_t& operator()(const Object& obj) {
+        return obj.get_impl();
+    }
+};
+
+}; // namespace v1
+}; // namespace ccl
+
 // ccl_comm_env
 
 ccl_comm_env::ccl_comm_env(std::shared_ptr<ccl::device> device) : device(device) {
@@ -148,7 +161,9 @@ void ccl_comm::init(int comm_id,
 #if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ZE)
         // init of fd manager is based on node comm,
         // it initializes for every creation of comm in multi comms case
-        init_ipc_exchange_mode(node_comm);
+        if (node_comm) {
+            init_ipc_exchange_mode(node_comm);
+        }
 #endif // CCL_ENABLE_SYCL && CCL_ENABLE_ZE
     }
     else {
@@ -160,6 +175,21 @@ void ccl_comm::init(int comm_id,
     if (comm_rank == 0) {
         LOG_DEBUG(to_string_ext());
     }
+
+#if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ZE)
+    for (int i = 0; i < ARC_MAX_NUM + 1; i++)
+        pattern_counter[i] = 0xa770;
+
+    if (ccl::global_data::env().enable_sycl_kernels && device_ptr != NULL) {
+        sycl::queue q(device_ptr->get_native());
+        if (q.get_context().get_backend() == sycl::backend::ext_oneapi_level_zero) {
+            ccl::stream op_stream = ccl::create_stream(q);
+            ccl::impl_dispatch disp;
+            ccl_stream* cclstream = get_stream_ptr(disp(op_stream));
+            coll_init(this, cclstream);
+        }
+    }
+#endif
 }
 
 ccl_comm::ccl_comm(int comm_id,
@@ -263,7 +293,11 @@ ccl_comm* ccl_comm::create(int size,
 
 void ccl_comm::create_topo_subcomms(std::shared_ptr<atl_base_comm> atl_comm) {
     r2r_comm = std::shared_ptr<ccl_comm>(create_subcomm(atl_comm->get_r2r_color()));
-    node_comm = std::shared_ptr<ccl_comm>(create_subcomm(topo_manager.get_host_idx()));
+
+    ccl_comm* node_comm_ptr = create_subcomm(topo_manager.get_host_idx());
+    CCL_THROW_IF_NOT(node_comm_ptr, "Failed to create node communicator");
+    node_comm = std::shared_ptr<ccl_comm>(node_comm_ptr);
+
     even_comm = std::shared_ptr<ccl_comm>(
         create_subcomm(topo_manager.get_inter_card_color(atl_comm->get_rank())));
     pair_comm = std::shared_ptr<ccl_comm>(create_subcomm(

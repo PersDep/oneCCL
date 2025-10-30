@@ -19,56 +19,14 @@
 #include "coll/algorithms/utils/sycl_kernels.hpp"
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
 
-template <typename T, int N>
-void inline read_write_kernel(std::array<void*, MAX_GPUS> even_ptrs,
-                              std::array<void*, MAX_GPUS> local_ptrs,
-                              std::array<void*, MAX_GPUS> pair_ptrs,
-                              const bool is_multi_tile,
-                              const size_t idx) {
-#pragma unroll
-    for (int i = 0; i < N; i++) {
-        const T val = ((T*)even_ptrs[i])[idx];
-        if (is_multi_tile) {
-            ((T*)pair_ptrs[i])[idx] = val;
-        }
-        ((T*)local_ptrs[i])[idx] = val;
-    }
-}
-
-template <typename T, int N, int vec_size>
-void inline read_write(std::array<void*, MAX_GPUS> even_ptrs,
-                       std::array<void*, MAX_GPUS> local_ptrs,
-                       std::array<void*, MAX_GPUS> pair_ptrs,
-                       const bool is_multi_tile,
-                       const size_t count,
-                       const sycl::nd_item<1> it) {
-    const size_t idx = it.get_global_linear_id();
-    const size_t packed_count = count / vec_size;
-
-    sycl::sub_group sg = it.get_sub_group();
-    const size_t sgSize = sg.get_local_range()[0];
-
-    int base = (idx / sgSize) * sgSize * vec_size;
-    const long rem_elem_count = count - base;
-
-    if (idx < packed_count) {
-        using AT = sycl::vec<T, vec_size>;
-        read_write_kernel<AT, N>(even_ptrs, local_ptrs, pair_ptrs, is_multi_tile, idx);
-    }
-    else {
-        const size_t new_idx = idx + (vec_size - 1) * packed_count;
-        if (new_idx < count) {
-            read_write_kernel<T, N>(even_ptrs, local_ptrs, pair_ptrs, is_multi_tile, new_idx);
-        }
-    }
-}
-
 template <typename T>
-ccl::event allgatherv_large_impl_ipc_ce(const void* send_buf,
+ccl::event allgatherv_large_impl_ipc_ce(sycl::queue& q,
+                                        const void* send_buf,
                                         size_t send_count,
                                         void* recv_buf,
                                         const ccl::vector_class<size_t>& recv_counts,
-                                        const ccl::vector_class<size_t>& offsets,
+                                        size_t orig_count,
+                                        size_t offset,
                                         ccl::datatype dtype,
                                         ccl_comm* comm,
                                         ccl_stream* global_stream,
@@ -76,7 +34,6 @@ ccl::event allgatherv_large_impl_ipc_ce(const void* send_buf,
                                         const ccl::vector_class<ccl::event>& deps) {
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const int dsize = ccl_dtype.size();
-    sycl::queue q = global_stream->get_native_stream();
     bool is_recording = use_recording_path(q);
 
     std::shared_ptr<ccl_comm> pair_comm = comm->get_pair_comm();
@@ -123,7 +80,7 @@ ccl::event allgatherv_large_impl_ipc_ce(const void* send_buf,
             int r = (i + even_comm->rank()) % even_comm->size();
             // TODO: make sure that get_node_rank() (or get_global_rank()) return the ABSOLUTE (i.e. MPI_COMM_WORLD) rank in the node
             const int global_rank = even_comm->get_node_rank(r);
-            const size_t offset_bytes = !offsets.empty() ? offsets[global_rank] : send_count * global_rank * dsize;
+            const size_t offset_bytes = offset + orig_count * global_rank * dsize;
 
             void* src = (char*)sycl_ptrs.xelink_ptrs_rd[r];
             void* local = (char*)recv_buf + offset_bytes;
@@ -151,7 +108,7 @@ ccl::event allgatherv_large_impl_ipc_ce(const void* send_buf,
     else {
         LOG_DEBUG("allgatherv large copy engine write");
         const int my_global_rank = node_comm->rank();
-        const size_t my_offset_bytes = send_count * my_global_rank * dsize;
+        const size_t my_offset_bytes = orig_count * my_global_rank * dsize;
 
         // TODO: can we delete this barrier
         sycl::event barrier_event0 = invoke_barrier(node_comm, q, dep_events, is_cpu_barrier);
@@ -172,8 +129,7 @@ ccl::event allgatherv_large_impl_ipc_ce(const void* send_buf,
             std::vector<sycl::event> cp_events2(even_comm->size());
             for (int i = 0; i < even_comm->size(); i++) {
                 const int global_rank = even_comm->get_node_rank(i);
-                const size_t offset_bytes =
-                    !offsets.empty() ? offsets[global_rank] : send_count * global_rank * dsize;
+                const size_t offset_bytes = offset + orig_count * global_rank * dsize;
 
                 void* src = (char*)recv_buf + offset_bytes;
                 void* dst = (char*)sycl_ptrs.mdfi_ptr_wr + offset_bytes;
@@ -193,11 +149,13 @@ ccl::event allgatherv_large_impl_ipc_ce(const void* send_buf,
 }
 
 template <typename T, int N, int vec_size_use>
-ccl::event allgatherv_large_impl_ipc(const void* send_buf,
+ccl::event allgatherv_large_impl_ipc(sycl::queue& q,
+                                     const void* send_buf,
                                      size_t send_count,
                                      void* recv_buf,
                                      const ccl::vector_class<size_t>& recv_counts,
-                                     const ccl::vector_class<size_t>& offsets,
+                                     size_t orig_count,
+                                     size_t offset,
                                      ccl::datatype dtype,
                                      ccl_comm* comm,
                                      ccl_stream* global_stream,
@@ -206,7 +164,6 @@ ccl::event allgatherv_large_impl_ipc(const void* send_buf,
     LOG_DEBUG("allgatherv large kernel no tmp buffer");
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const int dsize = ccl_dtype.size();
-    sycl::queue q = global_stream->get_native_stream();
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
 
     std::shared_ptr<ccl_comm> pair_comm = comm->get_pair_comm();
@@ -220,7 +177,7 @@ ccl::event allgatherv_large_impl_ipc(const void* send_buf,
     for (int i = 0; i < even_comm->size(); i++) {
         // offsets for read_write kernel
         const int global_rank = even_comm->get_node_rank(i);
-        const size_t offset_bytes = !offsets.empty() ? offsets[global_rank] : send_count * global_rank * dsize;
+        const size_t offset_bytes = offset + orig_count * global_rank * dsize;
         local_peer_even_ptrs[i] = (char*)sycl_ptrs.xelink_ptrs_rd[i];
         local_local_ptrs[i] = (char*)recv_buf + offset_bytes;
         local_peer_pair_ptrs[i] = (char*)sycl_ptrs.mdfi_ptr_wr + offset_bytes;
@@ -250,25 +207,26 @@ ccl::event allgatherv_large_impl_ipc(const void* send_buf,
 }
 
 template <typename T, int N, int vec_size_use>
-ccl::event allgatherv_large_impl_tmp(const void* send_buf,
+ccl::event allgatherv_large_impl_tmp(sycl::queue& q,
+                                     const void* send_buf,
                                      size_t send_count,
                                      void* recv_buf,
                                      const ccl::vector_class<size_t>& recv_counts,
-                                     const ccl::vector_class<size_t>& offsets,
+                                     size_t orig_count,
+                                     size_t offset,
                                      ccl::datatype dtype,
                                      ccl_comm* comm,
                                      ccl_stream* global_stream,
                                      sycl_ptrs_type& sycl_ptrs,
                                      const ccl::vector_class<ccl::event>& deps) {
     LOG_DEBUG("allgatherv large kernel with tmp buffer");
-    sycl::queue q = global_stream->get_native_stream();
     bool is_recording = use_recording_path(q);
 
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const size_t dsize = ccl_dtype.size();
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
 
-    static sycl::queue q_worker(q.get_device());
+    static sycl::queue q_worker(q.get_context(), q.get_device());
     static sycl::queue q_copy = get_mce_queue(q);
 
     sycl::queue q_use = q_worker;
@@ -299,7 +257,9 @@ ccl::event allgatherv_large_impl_tmp(const void* send_buf,
     const size_t chunk_count = chunk_size / dsize;
     const size_t num_chunks = send_count / chunk_count + (send_count % chunk_count != 0);
     const bool is_multi_tile = pair_comm_size > 1;
-
+    if (comm->is_multi_thread_instance() == true) {
+        pthread_barrier_wait(&ccl::global_data::get().shared_data->barrier_waits[comm->global_current_id]);
+    }
     std::vector<sycl::event> work_events;
     sycl::event output_event;
     for (size_t nc = 0; nc < num_chunks; nc++) {
@@ -316,8 +276,6 @@ ccl::event allgatherv_large_impl_tmp(const void* send_buf,
 
         // offset on send buffer
         const size_t my_offset_count_send = chunk_count * nc;
-        // offset on recv buffer
-        const size_t my_offset_count = send_count * comm_rank + my_offset_count_send;
         // offset on tmp buffer
         const size_t my_offset_count_tmp = chunk_count * comm_rank;
 
@@ -331,8 +289,7 @@ ccl::event allgatherv_large_impl_tmp(const void* send_buf,
             // offsets for read_write kernel
             int global_rank = comm->is_multi_thread_instance() ? i * pair_comm->size() + pair_comm->rank()
                                                                : even_comm->get_node_rank(i);
-            const size_t offset_bytes = !offsets.empty() ? offsets[global_rank] + chunk_count * nc * dsize
-                                                         : (send_count * global_rank + chunk_count * nc) * dsize;
+            const size_t offset_bytes = offset + (orig_count * global_rank + chunk_count * nc) * dsize;
             const size_t offset_bytes_tmp = chunk_count * global_rank * dsize;
 
             // xelink and mdfi ptrs are the tmp buffers in the other ranks
@@ -346,9 +303,7 @@ ccl::event allgatherv_large_impl_tmp(const void* send_buf,
             if (global_rank % pair_comm_size == 0) {
                 global_rank_neighbor = global_rank_neighbor + 1;
             }
-            const size_t offset_bytes_c = !offsets.empty()
-                                              ? offsets[global_rank_neighbor] + chunk_count * nc * dsize
-                                              : (send_count * global_rank_neighbor + chunk_count * nc) * dsize;
+            const size_t offset_bytes_c = offset + (orig_count * global_rank_neighbor + chunk_count * nc) * dsize;
             const size_t offset_bytes_c_tmp = chunk_count * global_rank_neighbor * dsize;
             recv_buf_dst_ptrs[i] = (char*)recv_buf + offset_bytes_c;
             tmp_buf_src_ptrs[i] = (char*)tmp_buf_use + offset_bytes_c_tmp;
@@ -359,7 +314,9 @@ ccl::event allgatherv_large_impl_tmp(const void* send_buf,
         }
 
         // start the collective
-
+        if (comm->is_multi_thread_instance() == true) {
+            pthread_barrier_wait(&ccl::global_data::get().shared_data->barrier_waits[comm->global_current_id]);
+        }
         // if send_count is not a multiple of chunk_count, then last chunk will contain only remainder data
         const size_t data_count = (nc < send_count / chunk_count) ? chunk_count : send_count % chunk_count;
         const size_t data_count_next =
@@ -505,18 +462,22 @@ ccl::event allgatherv_large_impl_tmp(const void* send_buf,
             output_event = submit_wait_on_events(q, work_events);
         }
     } // nc
-
+    if (comm->is_multi_thread_instance() == true) {
+        pthread_barrier_wait(&ccl::global_data::get().shared_data->barrier_waits[comm->global_current_id]);
+    }
     return ccl::event::create_from_native(output_event);
 }
 
 // NE is the number of ranks in even_comm and
 // NP is the number of ranks in pair_comm
 template <typename T, int NE, int NP, bool use_full_vector>
-ccl::event allgatherv_large_impl(const void* send_buf,
+ccl::event allgatherv_large_impl(sycl::queue& q,
+                                 const void* send_buf,
                                  size_t send_count,
                                  void* recv_buf,
                                  const ccl::vector_class<size_t>& recv_counts,
-                                 const ccl::vector_class<size_t>& offsets,
+                                 size_t orig_count,
+                                 size_t offset,
                                  ccl::datatype dtype,
                                  ccl_comm* comm,
                                  ccl_stream* global_stream,
@@ -535,16 +496,46 @@ ccl::event allgatherv_large_impl(const void* send_buf,
     ccl::event e;
     // TODO: copy engines currently does not support tmp buf
     if (ccl::global_data::env().sycl_copy_engine) {
-        e = allgatherv_large_impl_ipc_ce<T>(
-            send_buf, send_count, recv_buf, recv_counts, offsets, dtype, comm, global_stream, sycl_ptrs, deps);
+        e = allgatherv_large_impl_ipc_ce<T>(q,
+                                            send_buf,
+                                            send_count,
+                                            recv_buf,
+                                            recv_counts,
+                                            orig_count,
+                                            offset,
+                                            dtype,
+                                            comm,
+                                            global_stream,
+                                            sycl_ptrs,
+                                            deps);
     }
     else if (!is_tmp_used) {
-        e = allgatherv_large_impl_ipc<T, N, vec_size_use>(
-            send_buf, send_count, recv_buf, recv_counts, offsets, dtype, comm, global_stream, sycl_ptrs, deps);
+        e = allgatherv_large_impl_ipc<T, N, vec_size_use>(q,
+                                                          send_buf,
+                                                          send_count,
+                                                          recv_buf,
+                                                          recv_counts,
+                                                          orig_count,
+                                                          offset,
+                                                          dtype,
+                                                          comm,
+                                                          global_stream,
+                                                          sycl_ptrs,
+                                                          deps);
     }
     else {
-        e = allgatherv_large_impl_tmp<T, N, vec_size_use>(
-            send_buf, send_count, recv_buf, recv_counts, offsets, dtype, comm, global_stream, sycl_ptrs, deps);
+        e = allgatherv_large_impl_tmp<T, N, vec_size_use>(q,
+                                                          send_buf,
+                                                          send_count,
+                                                          recv_buf,
+                                                          recv_counts,
+                                                          orig_count,
+                                                          offset,
+                                                          dtype,
+                                                          comm,
+                                                          global_stream,
+                                                          sycl_ptrs,
+                                                          deps);
     }
     return e;
 }

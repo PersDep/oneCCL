@@ -68,28 +68,27 @@ ccl::event run_allgatherv_small(ccl::datatype dtype,
 
 #include "coll/algorithms/allgatherv/sycl/allgatherv_small_sycl_impl.hpp"
 
-ccl::event allgatherv_small(const void* send_buf,
+ccl::event allgatherv_small(sycl::queue& q,
+                            const void* send_buf,
                             size_t send_count,
                             void* recv_buf,
                             const ccl::vector_class<size_t>& recv_counts,
-                            const ccl::vector_class<size_t>& offsets,
+                            size_t orig_count,
+                            size_t offset,
                             ccl::datatype dtype,
                             ccl_comm* comm,
                             ccl_stream* global_stream,
                             const ccl::vector_class<ccl::event>& deps) {
-    LOG_DEBUG("invoking allgatherv_small");
-
     if (comm->is_multi_thread_instance() == true) {
         LOG_DEBUG("|MT|: invoking allgatherv_small");
-        coll_initExt(comm, ccl::global_data::get().shared_data->hash_table, global_stream);
     }
     else {
         LOG_DEBUG("invoking allgatherv_small");
-        coll_init(comm, global_stream);
     }
+
     auto lambda = [&]<typename T, int NE, int NP>() {
         return allgatherv_small_impl<T, NE, NP>(
-            send_buf, send_count, recv_buf, recv_counts, offsets, dtype, comm, global_stream, deps);
+            q, send_buf, send_count, recv_buf, recv_counts, orig_count, offset, dtype, comm, global_stream, deps);
     };
     return invoke_collective(lambda, comm, dtype);
 }
