@@ -23,6 +23,8 @@
 #include "common/utils/sycl_utils.hpp"
 #endif // CCL_ENABLE_SYCL
 
+#include "coll/reduction/reduction.hpp"
+
 #define COPY_COMMON_OP_ATTRS(from, to) \
     to->priority = from.get<ccl::operation_attr_id::priority>(); \
     to->synchronous = from.get<ccl::operation_attr_id::synchronous>(); \
@@ -468,6 +470,10 @@ void ccl_coll_param::validate() const {
                     // CCL_THROW_IF_NOT produce and error message which CI interprets as a failed test,
                     // however in some cases we want to throw exception, catch it and skip the average test.
                     CCL_THROW("average operation is not supported for the scheduler path");
+                }
+                if (ccl_reduction_type_storage::is_custom(reduction)) {
+                    CCL_THROW(
+                        "user-defined reduction operation is not supported for the scheduler path");
                 }
             }
 

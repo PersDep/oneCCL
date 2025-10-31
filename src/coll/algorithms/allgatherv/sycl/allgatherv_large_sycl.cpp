@@ -16,11 +16,13 @@
 #include "coll/algorithms/allgatherv/sycl/allgatherv_sycl.hpp"
 #include "coll/algorithms/allgatherv/sycl/allgatherv_large_sycl_impl.hpp"
 
-ccl::event allgatherv_large(const void* send_buf,
+ccl::event allgatherv_large(sycl::queue& q,
+                            const void* send_buf,
                             size_t send_count,
                             void* recv_buf,
                             const ccl::vector_class<size_t>& recv_counts,
-                            const ccl::vector_class<size_t>& offsets,
+                            size_t orig_count,
+                            size_t offset,
                             ccl::datatype dtype,
                             ccl_comm* comm,
                             ccl_stream* global_stream,
@@ -101,17 +103,8 @@ ccl::event allgatherv_large(const void* send_buf,
         }
         delete exchange_entry;
         delete sched;
-
-        coll_init(comm, global_stream);
     }
     else {
-        if (comm->is_multi_thread_instance() == true) {
-            coll_initExt(comm, ccl::global_data::get().shared_data->hash_table, global_stream);
-        }
-        else {
-            coll_init(comm, global_stream);
-        }
-
         sycl_ptrs.xelink_ptrs_rd = get_remote_even_tmp_buf(0, comm);
         if (pair_comm->size() > 1) {
             assert(pair_comm->size() == MAX_TILES);
@@ -122,11 +115,13 @@ ccl::event allgatherv_large(const void* send_buf,
 
     auto lambda = [&]<typename T, int NE, int NP>() {
         if (use_full_vector) {
-            return allgatherv_large_impl<T, NE, NP, true>(send_buf,
+            return allgatherv_large_impl<T, NE, NP, true>(q,
+                                                          send_buf,
                                                           send_count,
                                                           recv_buf,
                                                           recv_counts,
-                                                          offsets,
+                                                          orig_count,
+                                                          offset,
                                                           dtype,
                                                           comm,
                                                           global_stream,
@@ -135,11 +130,13 @@ ccl::event allgatherv_large(const void* send_buf,
                                                           is_tmp_used);
         }
         else {
-            return allgatherv_large_impl<T, NE, NP, false>(send_buf,
+            return allgatherv_large_impl<T, NE, NP, false>(q,
+                                                           send_buf,
                                                            send_count,
                                                            recv_buf,
                                                            recv_counts,
-                                                           offsets,
+                                                           orig_count,
+                                                           offset,
                                                            dtype,
                                                            comm,
                                                            global_stream,

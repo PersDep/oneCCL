@@ -127,17 +127,18 @@ void inline gather(const void* send,
 // NE is the number of ranks in even_comm and
 // NP is the number of ranks in pair_comm
 template <typename T, int NE, int NP>
-ccl::event allgatherv_small_impl(const void* send_buf,
+ccl::event allgatherv_small_impl(sycl::queue& q,
+                                 const void* send_buf,
                                  size_t send_count,
                                  void* recv_buf,
                                  const ccl::vector_class<size_t>& recv_counts,
-                                 const ccl::vector_class<size_t>& offsets,
+                                 size_t orig_count,
+                                 size_t offset,
                                  ccl::datatype dtype,
                                  ccl_comm* comm,
                                  ccl_stream* global_stream,
                                  const ccl::vector_class<ccl::event>& deps) {
     constexpr int N = NE * NP;
-    sycl::queue q = global_stream->get_native_stream();
 
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const size_t dsize = ccl_dtype.size();
@@ -177,10 +178,13 @@ ccl::event allgatherv_small_impl(const void* send_buf,
 
     auto [local_tmp_buf, remote_ptrs] =
         is_recording ? node_comm->get_all_tmp_bufs_gpu(true) : node_comm->get_all_tmp_bufs(true);
+    int* tmp_buf_idx = node_comm->get_tmp_buf_idx();
 
     std::vector<sycl::event> dep_events = get_sycl_events(deps);
     sycl::event kernel_event;
-
+    if (comm->is_multi_thread_instance() == true) {
+        pthread_barrier_wait(&ccl::global_data::get().shared_data->barrier_waits[comm->global_current_id]);
+    }
     // VS : vec_size, SGS : sub_group_size, LB : use_local_barrier, GB : use_global_barrier
     auto gather_invoke = [=, &q]<int VS, int SGS, int LB, int GB>(std::vector<sycl::event> sycl_deps) {
         constexpr int use_block = 1;
@@ -208,7 +212,7 @@ ccl::event allgatherv_small_impl(const void* send_buf,
         std::array<void*, MAX_NODE_RANKS> out_ptrs;
         // TODO: is it better to only pass recv_buf to the kernel and do this calculation there
         for (int i = 0; i < comm_size; i++) {
-            out_ptrs[i] = !offsets.empty() ? (char*)recv_buf + offsets[i] : (char*)recv_buf + i * count * dsize;
+            out_ptrs[i] = (char*)recv_buf + orig_count * i * dsize + offset;
         }
 
         ccl_kernel_barrier_data kernel_barrier_data = get_kernel_barrier_data(comm).inc_slot();
@@ -220,35 +224,56 @@ ccl::event allgatherv_small_impl(const void* send_buf,
             h.parallel_for(
                 sycl::nd_range<1>(kernel_size, wg_size),
                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(sg_size)]] {
+                    auto local_tmp_buf_cpy = local_tmp_buf;
+                    auto remote_ptrs_cpy = remote_ptrs;
+                    if (is_recording) {
+                        size_t offset_bytes = *tmp_buf_idx * ccl_tmp_bufs::buf_size;
+                        local_tmp_buf_cpy =
+                            static_cast<void*>(static_cast<uint8_t*>(local_tmp_buf) + offset_bytes);
+                        for (size_t rem_idx = 0; rem_idx < remote_ptrs.size(); ++rem_idx) {
+                            remote_ptrs_cpy[rem_idx] =
+                                static_cast<void*>(static_cast<uint8_t*>(remote_ptrs[rem_idx]) + offset_bytes);
+                        }
+                    }
                     gather<T, N, VS, use_block, LB, GB>(send_buf,
-                                                        local_tmp_buf,
+                                                        local_tmp_buf_cpy,
                                                         out_ptrs,
-                                                        remote_ptrs,
+                                                        remote_ptrs_cpy,
                                                         kernel_barrier_data,
                                                         comm_barrier_data,
                                                         send_count,
                                                         count,
                                                         last_count,
                                                         it);
+                    if (is_recording && it.get_global_linear_id() == 0) {
+                        *tmp_buf_idx = (*tmp_buf_idx + 1) % ccl_tmp_bufs::buf_count;
+                    }
                 });
         });
         return local_event;
     };
-
+    if (comm->is_multi_thread_instance() == true) {
+        pthread_barrier_wait(&ccl::global_data::get().shared_data->barrier_waits[comm->global_current_id]);
+    }
     // three phases of allgather: local copy to tmp, comm_barrier, gather
     // VS : vec_size
     auto memcpy_gather = [=, &q]<int VS>() {
-        sycl::event memcpy_event = q.submit([=](sycl::handler& h) {
-            h.depends_on(dep_events);
-            h.memcpy(local_tmp_buf, send_buf, dsize * send_count);
-        });
+        sycl::event memcpy_event;
+        if (is_recording) {
+            memcpy_event =
+                kernel_memcpy(q, send_buf, local_tmp_buf, nullptr, tmp_buf_idx, send_count, dsize, dep_events);
+        }
+        else {
+            memcpy_event = q.submit([=](sycl::handler& h) {
+                h.depends_on(dep_events);
+                h.memcpy(local_tmp_buf, send_buf, dsize * send_count);
+            });
+        }
 
         sycl::event barrier_event = invoke_barrier(node_comm, q, { memcpy_event }, use_cpu_barrier);
 
         sycl::event local_event = gather_invoke.template operator()<VS, 32, 0, 0>({ barrier_event });
-        if (is_recording) {
-            local_event = invoke_barrier(node_comm, q, { local_event }, use_cpu_barrier);
-        }
+
         return local_event;
     };
 
@@ -295,7 +320,8 @@ ccl::event allgatherv_small_impl(const void* send_buf,
         kernel_event = gather_invoke.template operator()<vec_size, 32, 1, 1>(dep_events);
     }
     else if (count * dsize <= sec_3) {
-        constexpr int vec_size = get_num_elements<T, 32>();
+        constexpr int vec_bytes = (std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>) ? 16 : 32;
+        constexpr int vec_size = get_num_elements<T, vec_bytes>();
         // <vec_size, sub_group_size, use_local_barrier, use_global_barrier>
         kernel_event = gather_invoke.template operator()<vec_size, 16, 1, 1>(dep_events);
     }
@@ -303,6 +329,8 @@ ccl::event allgatherv_small_impl(const void* send_buf,
         constexpr int vec_size = get_num_elements<T, 8>();
         kernel_event = memcpy_gather.template operator()<vec_size>();
     }
-
+    if (comm->is_multi_thread_instance() == true) {
+        pthread_barrier_wait(&ccl::global_data::get().shared_data->barrier_waits[comm->global_current_id]);
+    }
     return ccl::event::create_from_native(kernel_event);
 }

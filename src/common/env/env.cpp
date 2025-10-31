@@ -145,8 +145,8 @@ env_data::env_data()
           enable_strict_order(0),
           staging_buffer(ccl_staging_regular),
           enable_op_sync(0),
-          enable_hostname_sharing(0),
-          enable_init_hostname_sharing(0),
+          enable_hostname_sharing(1),
+          enable_init_hostname_sharing(1),
 
           chunk_count(1),
           min_chunk_size(65536),
@@ -191,6 +191,7 @@ env_data::env_data()
           sycl_reduce_scatter_medium_threshold(67108864),
           sycl_reduce_scatter_scaleout_threshold(4294967296),
           sycl_reduce_scatter_scaleout_algo("auto"),
+          sycl_reduce_scatter_ll_threshold(512),
 
           sycl_allgatherv_tmp_buf(0),
           sycl_allgatherv_small_threshold(131072),
@@ -198,10 +199,13 @@ env_data::env_data()
           sycl_allgatherv_scaleout_threshold(1073741824),
           sycl_allgatherv_scaleout_algo("auto"),
           sycl_allgatherv_ll_threshold(2048),
+          sycl_allgatherv_scaleout_overlap(1),
 
           sycl_broadcast_tmp_buf(0),
           sycl_broadcast_small_threshold(524288),
           sycl_broadcast_scaleout_threshold(4294967296),
+
+          sycl_enable_arc_alltoall_ll(0),
 
           enable_sycl_kernels(1),
 
@@ -215,6 +219,7 @@ env_data::env_data()
           sycl_esimd(0),
           sycl_full_vector(1),
           sycl_force_recording_path(0),
+          sycl_kernel_memcpy_upsize(0),
           sycl_tmp_buf_size(3 * 128 * 1024 * 1024),
           sycl_scaleout_host_buf_size(1024 * 1024 * 1024),
           sycl_scaleout_device_buf_size(1024 * 1024 * 1024),
@@ -226,6 +231,7 @@ env_data::env_data()
           sycl_pipeline_chunk_size(CCL_ENV_SIZET_NOT_SPECIFIED),
           sycl_enable_pipeline_gpu_rdma(0),
           sycl_enable_direct_gpu_rdma(0),
+          sycl_pipeline_gpu_rdma(0),
           sycl_sub_communicator(1),
           sycl_force_pcie(0),
 #endif // CCL_ENABLE_SYCL
@@ -558,6 +564,7 @@ void env_data::parse() {
     p.env_2_type(CCL_SYCL_REDUCE_SCATTER_MEDIUM_THRESHOLD, sycl_reduce_scatter_medium_threshold);
     p.env_2_type(CCL_SYCL_REDUCE_SCATTER_SCALEOUT_THRESHOLD, sycl_reduce_scatter_scaleout_threshold);
     p.env_2_type(CCL_SYCL_REDUCE_SCATTER_SCALEOUT, sycl_reduce_scatter_scaleout_algo);
+    p.env_2_type(CCL_SYCL_REDUCE_SCATTER_LL_THRESHOLD, sycl_reduce_scatter_ll_threshold);
 
     p.env_2_type(CCL_SYCL_ALLGATHERV_TMP_BUF, sycl_allgatherv_tmp_buf);
     p.env_2_type(CCL_SYCL_ALLGATHERV_SMALL_THRESHOLD, sycl_allgatherv_small_threshold);
@@ -565,10 +572,13 @@ void env_data::parse() {
     p.env_2_type(CCL_SYCL_ALLGATHERV_SCALEOUT_THRESHOLD, sycl_allgatherv_scaleout_threshold);
     p.env_2_type(CCL_SYCL_ALLGATHERV_SCALEOUT, sycl_allgatherv_scaleout_algo);
     p.env_2_type(CCL_SYCL_ALLGATHERV_LL_THRESHOLD, sycl_allgatherv_ll_threshold);
+    p.env_2_type(CCL_SYCL_ALLGATHERV_SCALEOUT_OVERLAP, sycl_allgatherv_scaleout_overlap);
 
     p.env_2_type(CCL_SYCL_BROADCAST_TMP_BUF, sycl_broadcast_tmp_buf);
     p.env_2_type(CCL_SYCL_BROADCAST_SMALL_THRESHOLD, sycl_broadcast_small_threshold);
     p.env_2_type(CCL_SYCL_BROADCAST_SCALEOUT_THRESHOLD, sycl_broadcast_scaleout_threshold);
+
+    p.env_2_type(CCL_SYCL_ALLTOALL_ARC_LL, sycl_enable_arc_alltoall_ll);
 
     p.env_2_type(CCL_ENABLE_SYCL_KERNELS, enable_sycl_kernels);
 
@@ -582,6 +592,7 @@ void env_data::parse() {
     p.env_2_type(CCL_SYCL_ESIMD, sycl_esimd);
     p.env_2_type(CCL_SYCL_FULL_VECTOR, sycl_full_vector);
     p.env_2_type(CCL_SYCL_FORCE_RECORDING_PATH, sycl_force_recording_path);
+    p.env_2_type(CCL_SYCL_KERNEL_MEMCPY_UPSIZE, sycl_kernel_memcpy_upsize);
     p.env_2_type(CCL_SYCL_TMP_BUF_SIZE, sycl_tmp_buf_size);
     p.env_2_type(CCL_SYCL_SCALEOUT_HOST_BUF_SIZE, sycl_scaleout_host_buf_size);
     p.env_2_type(CCL_SYCL_SCALEOUT_DEVICE_BUF_SIZE, sycl_scaleout_device_buf_size);
@@ -593,6 +604,7 @@ void env_data::parse() {
     p.env_2_type(CCL_SYCL_PIPELINE_CHUNK_SIZE, (size_t&)sycl_pipeline_chunk_size);
     p.env_2_type(CCL_SYCL_ENABLE_PIPELINE_GPU_RDMA, sycl_enable_pipeline_gpu_rdma);
     p.env_2_type(CCL_SYCL_ENABLE_DIRECT_GPU_RDMA, sycl_enable_direct_gpu_rdma);
+    p.env_2_type(CCL_SYCL_PIPELINE_GPU_RDMA, sycl_pipeline_gpu_rdma);
     p.env_2_type(CCL_SYCL_SUB_COMMUICATOR, sycl_sub_communicator);
     p.env_2_type(CCL_SYCL_FORCE_PCIE, sycl_force_pcie);
 #endif // CCL_ENABLE_SYCL
@@ -1032,6 +1044,7 @@ void env_data::print(int rank, bool is_profile_mode, bool is_mt_enabled) {
     LOG_INFO_PROFILED(CCL_SYCL_REDUCE_SCATTER_MEDIUM_THRESHOLD, ": ", sycl_reduce_scatter_medium_threshold);
     LOG_INFO_PROFILED(CCL_SYCL_REDUCE_SCATTER_SCALEOUT_THRESHOLD, ": ", sycl_reduce_scatter_scaleout_threshold);
     LOG_INFO_PROFILED(CCL_SYCL_REDUCE_SCATTER_SCALEOUT, ": ", (!sycl_reduce_scatter_scaleout_algo.empty()) ? sycl_reduce_scatter_scaleout_algo : CCL_ENV_STR_NOT_SPECIFIED);
+    LOG_INFO_PROFILED(CCL_SYCL_REDUCE_SCATTER_LL_THRESHOLD, ": ", sycl_reduce_scatter_ll_threshold);
 
     LOG_INFO_PROFILED(CCL_SYCL_ALLGATHERV_TMP_BUF, ": ", sycl_allgatherv_tmp_buf);
     LOG_INFO_PROFILED(CCL_SYCL_ALLGATHERV_SMALL_THRESHOLD, ": ", sycl_allgatherv_small_threshold);
@@ -1039,10 +1052,13 @@ void env_data::print(int rank, bool is_profile_mode, bool is_mt_enabled) {
     LOG_INFO_PROFILED(CCL_SYCL_ALLGATHERV_SCALEOUT_THRESHOLD, ": ", sycl_allgatherv_scaleout_threshold);
     LOG_INFO_PROFILED(CCL_SYCL_ALLGATHERV_SCALEOUT, ": ", (!sycl_allgatherv_scaleout_algo.empty()) ? sycl_allgatherv_scaleout_algo : CCL_ENV_STR_NOT_SPECIFIED);
     LOG_INFO_PROFILED(CCL_SYCL_ALLGATHERV_LL_THRESHOLD, ": ", sycl_allgatherv_ll_threshold);
+    LOG_INFO_PROFILED(CCL_SYCL_ALLGATHERV_SCALEOUT_OVERLAP, ": ", sycl_allgatherv_scaleout_overlap);
 
     LOG_INFO_PROFILED(CCL_SYCL_BROADCAST_TMP_BUF, ": ", sycl_broadcast_tmp_buf);
     LOG_INFO_PROFILED(CCL_SYCL_BROADCAST_SMALL_THRESHOLD, ": ", sycl_broadcast_small_threshold);
     LOG_INFO_PROFILED(CCL_SYCL_BROADCAST_SCALEOUT_THRESHOLD, ": ", sycl_broadcast_scaleout_threshold);
+
+    LOG_INFO_PROFILED(CCL_SYCL_ALLTOALL_ARC_LL, ": ", sycl_enable_arc_alltoall_ll);
 
     LOG_INFO_PROFILED(CCL_ENABLE_SYCL_KERNELS, ": ", enable_sycl_kernels);
 
@@ -1066,6 +1082,7 @@ void env_data::print(int rank, bool is_profile_mode, bool is_mt_enabled) {
     LOG_INFO_PROFILED(CCL_SYCL_PIPELINE_CHUNK_SIZE, ": ", (sycl_pipeline_chunk_size != CCL_ENV_SIZET_NOT_SPECIFIED) ? std::to_string(sycl_pipeline_chunk_size) : CCL_ENV_STR_NOT_SPECIFIED);
     LOG_INFO_PROFILED(CCL_SYCL_ENABLE_PIPELINE_GPU_RDMA, ": ", sycl_enable_pipeline_gpu_rdma);
     LOG_INFO_PROFILED(CCL_SYCL_ENABLE_DIRECT_GPU_RDMA, ": ", sycl_enable_direct_gpu_rdma);
+    LOG_INFO_PROFILED(CCL_SYCL_PIPELINE_GPU_RDMA, ": ", sycl_pipeline_gpu_rdma);
     LOG_INFO_PROFILED(CCL_SYCL_SUB_COMMUICATOR, ": ", sycl_sub_communicator);
     LOG_INFO_PROFILED(CCL_SYCL_FORCE_PCIE, ": ", sycl_force_pcie);
 #endif // CCL_ENABLE_SYCL

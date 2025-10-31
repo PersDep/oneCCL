@@ -18,8 +18,6 @@
 #include "oneapi/ccl.hpp"
 #include "common/global/global.hpp"
 #include "coll/algorithms/utils/sycl_kernels.hpp"
-#include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_impl.hpp"
-#include "coll/algorithms/allgatherv/sycl/allgatherv_large_sycl_impl.hpp"
 
 template <typename T, int N, int vec_size>
 ccl::event allreduce_large_read_write_ipc(const void *send_buf,
@@ -39,6 +37,8 @@ ccl::event allreduce_large_read_write_ipc(const void *send_buf,
     const bool is_use_tmp = ccl::global_data::env().sycl_allreduce_tmp_buf;
     std::shared_ptr<ccl_comm> node_comm = comm->get_node_comm();
     const int node_comm_size = node_comm->size();
+
+    ccl_reduction_data reduction_op = make_reduction_operation(reduction);
 
     CCL_THROW_IF_NOT(
         node_comm->size() == N,
@@ -93,15 +93,16 @@ ccl::event allreduce_large_read_write_ipc(const void *send_buf,
         h.parallel_for(
             sycl::nd_range<1>(kernel_size, work_group_size),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(sub_group_size)]] {
-                reduce_sum<T, N, vec_size, 1, 0, 0, 0>(nullptr,
-                                                       nullptr,
-                                                       nullptr,
-                                                       src_ptrs,
-                                                       dst_ptrs,
-                                                       dummy_kbd,
-                                                       dummy_cbd,
-                                                       count_use,
-                                                       it);
+                reduce_base<T, N, vec_size, 1, 0, 0, 0>(nullptr,
+                                                        nullptr,
+                                                        nullptr,
+                                                        src_ptrs,
+                                                        dst_ptrs,
+                                                        dummy_kbd,
+                                                        dummy_cbd,
+                                                        reduction_op,
+                                                        count_use,
+                                                        it);
             });
     });
     barrier_event = invoke_barrier(node_comm, q, { work_event }, is_cpu_barrier);
@@ -144,6 +145,8 @@ ccl::event allreduce_large_read_write_tmp(const void *send_buf,
     CCL_THROW_IF_NOT(
         node_comm->size() == N,
         "SYCL allreduce read write algo implemented for single plane or single GPU cases");
+
+    ccl_reduction_data reduction_op = make_reduction_operation(reduction);
 
     std::array<void *, MAX_NODE_RANKS> l_src_ptrs, l_dst_ptrs;
     void *src_tmp_ptr = get_tmp_buf(1, comm);
@@ -223,15 +226,16 @@ ccl::event allreduce_large_read_write_tmp(const void *send_buf,
             h.parallel_for(
                 sycl::nd_range<1>(kernel_size, work_group_size),
                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(sub_group_size)]] {
-                    reduce_sum<T, N, vec_size, 1, 0, 0, 0>(nullptr,
-                                                           nullptr,
-                                                           nullptr,
-                                                           l_src_ptrs,
-                                                           l_dst_ptrs,
-                                                           dummy_kbd,
-                                                           dummy_cbd,
-                                                           count_use,
-                                                           it);
+                    reduce_base<T, N, vec_size, 1, 0, 0, 0>(nullptr,
+                                                            nullptr,
+                                                            nullptr,
+                                                            l_src_ptrs,
+                                                            l_dst_ptrs,
+                                                            dummy_kbd,
+                                                            dummy_cbd,
+                                                            reduction_op,
+                                                            count_use,
+                                                            it);
                 });
         });
         barrier_event = invoke_barrier(node_comm, q, { work_event }, is_cpu_barrier);
@@ -273,13 +277,14 @@ ccl::event allreduce_large_impl(const void *send_buf,
                                 ccl_comm *comm,
                                 ccl_stream *global_stream,
                                 sycl_ptrs_type &sycl_ptrs,
-                                const ccl::vector_class<ccl::event> &deps) {
+                                const ccl::vector_class<ccl::event> &deps,
+                                const bool use_tmp) {
     constexpr int N = NE;
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const int dsize = ccl_dtype.size();
     sycl::queue q = global_stream->get_native_stream();
     sycl::queue q_use = q;
-    const bool is_use_tmp = ccl::global_data::env().sycl_allreduce_tmp_buf;
+    const bool is_use_tmp = use_tmp; // ccl::global_data::env().sycl_allreduce_tmp_buf;
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
 
     std::shared_ptr<ccl_comm> pair_comm = comm->get_pair_comm();
@@ -290,15 +295,23 @@ ccl::event allreduce_large_impl(const void *send_buf,
     const int even_comm_size = even_comm->size();
     const int node_comm_size = node_comm->size();
 
+    LOG_DEBUG("allreduce_large_impl called: ",
+              "count: ",
+              count,
+              ", reduction operation: ",
+              int(reduction));
+
     const bool is_multi_tile = pair_comm_size > 1;
     const bool is_multi_gpu = even_comm_size > 1;
     const bool is_single_plane = !is_multi_tile && is_multi_gpu;
     const bool is_single_gpu = is_multi_tile && !is_multi_gpu;
-    const bool is_use_rw_opt = is_single_gpu || is_single_plane;
+    // TODO: custom reduction can be supported in rw-optimization tmp path
+    const bool is_use_rw_opt =
+        (is_single_gpu || is_single_plane) && !ccl_reduction_type_storage::is_custom(reduction);
 
     constexpr int pipeline_size = 2;
     constexpr int vec_size = get_num_elements<T, 8, use_full_vector>();
-    const size_t work_group_size = 16;
+    constexpr int work_group_size = 16;
 
     // single plane/gpu case optimizations
     if (is_use_rw_opt) {
@@ -362,6 +375,9 @@ ccl::event allreduce_large_impl(const void *send_buf,
         pthread_barrier_wait(
             &ccl::global_data::get().shared_data->barrier_waits[comm->global_current_id]);
     }
+
+    ccl_reduction_data reduction_op = make_reduction_operation(reduction);
+    const bool reduce_has_pre_operation = ccl_reduction_type_storage::is_custom(reduction);
 
     std::array<void *, MAX_GPUS> l_mdfi_send_ptrs, l_xelink_work_wr_ptrs, l_send_ptrs,
         l_send_ptrs_rem;
@@ -490,12 +506,32 @@ ccl::event allreduce_large_impl(const void *send_buf,
                 h.parallel_for(
                     sycl::nd_range<1>(kernel_size, work_group_size),
                     [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(work_group_size)]] {
-                        // copy first chunk from send buf to tmp buf
-                        copy_data<T, N, vec_size>(
-                            l_send_cp_dst_ptrs, l_send_cp_src_ptrs, data_count, it);
-                        // copy the tail unaligned data from send buf to tmp buf's next offset
-                        copy_data<T, 1, vec_size>(
-                            l_send_ptrs_rem, l_send_buf_pack_ptr, rem_count, it);
+                        if (!reduce_has_pre_operation) {
+                            // copy first chunk from send buf to tmp buf
+                            copy_data<T, N, vec_size>(
+                                l_send_cp_dst_ptrs, l_send_cp_src_ptrs, data_count, it);
+                            // copy the tail unaligned data from send buf to tmp buf's next offset
+                            copy_data<T, 1, vec_size>(
+                                l_send_ptrs_rem, l_send_buf_pack_ptr, rem_count, it);
+                        }
+                        else {
+                            // copy first chunk from send buf to tmp buf
+                            // apply user defined pre-operation on each copied data element
+                            copy_and_modify_data<T, vec_size>(l_send_cp_dst_ptrs,
+                                                              l_send_cp_src_ptrs,
+                                                              even_comm_size,
+                                                              data_count,
+                                                              reduction_op,
+                                                              it);
+                            // copy the tail unaligned data from send buf to tmp buf's next offset
+                            // apply user defined pre-operation on each copied data element
+                            copy_and_modify_data<T, vec_size>(l_send_ptrs_rem,
+                                                              l_send_buf_pack_ptr,
+                                                              1 /* comm_size */,
+                                                              rem_count,
+                                                              reduction_op,
+                                                              it);
+                        }
                     });
             });
         }
@@ -506,6 +542,11 @@ ccl::event allreduce_large_impl(const void *send_buf,
                 h.memcpy(
                     l_send_ptrs_rem[0], (char *)send_buf + pack_count * dsize, rem_count * dsize);
             });
+            if (reduce_has_pre_operation) {
+                // apply user defined pre-operation on each copied data element
+                work_event = pre_operation_invoke<T, vec_size, work_group_size>(
+                    q, l_send_ptrs_rem[0], rem_count, false, nullptr, reduction_op, { work_event });
+            }
         }
 
         std::vector<sycl::event> barrier_deps;
@@ -549,41 +590,58 @@ ccl::event allreduce_large_impl(const void *send_buf,
                     read_reduce_write<T, N, vec_size>(l_mdfi_send_ptrs,
                                                       l_send_ptrs,
                                                       l_xelink_work_wr_ptrs,
+                                                      reduction_op,
                                                       is_multi_tile,
                                                       data_count,
                                                       it);
 
                     // <typename T, int N, int vec_size, int use_block, int use_local_barrier, int use_global_barrier, int read_all>
                     if (nc > 0) {
-                        reduce_sum<T, N, vec_size, 1, 0, 0>(nullptr,
-                                                            l_reduce_sum_dst_prev,
-                                                            nullptr,
-                                                            l_work_ptrs_prev,
-                                                            l_work_ptrs_prev,
-                                                            dummy_kbd,
-                                                            dummy_cbd,
-                                                            data_count_prev,
-                                                            it);
+                        reduce_base<T, N, vec_size, 1, 0, 0>(nullptr,
+                                                             l_reduce_sum_dst_prev,
+                                                             nullptr,
+                                                             l_work_ptrs_prev,
+                                                             l_work_ptrs_prev,
+                                                             dummy_kbd,
+                                                             dummy_cbd,
+                                                             reduction_op,
+                                                             data_count_prev,
+                                                             it);
                     }
 
                     if (is_use_tmp && nc < num_chunks - 1 && is_multi_tile) {
-                        copy_data<T, N, vec_size>(
-                            l_send_cp_dst_ptrs_next, l_send_cp_src_ptrs_next, data_count_next, it);
+                        // copy next chunk from send buf to tmp buf
+                        if (!reduce_has_pre_operation) {
+                            copy_data<T, N, vec_size>(l_send_cp_dst_ptrs_next,
+                                                      l_send_cp_src_ptrs_next,
+                                                      data_count_next,
+                                                      it);
+                        }
+                        else {
+                            // apply user defined pre-operation on each copied data element
+                            copy_and_modify_data<T, vec_size>(l_send_cp_dst_ptrs_next,
+                                                              l_send_cp_src_ptrs_next,
+                                                              even_comm_size,
+                                                              data_count_next,
+                                                              reduction_op,
+                                                              it);
+                        }
                     }
 
                     if (nc == 0 && rem_count != 0) {
                         // TODO: change this node_comm allreduce to reduce on last rank
                         // and then as part of read_write kernel, perform the allgather
                         // so as to make it work with scaleout
-                        reduce_sum<T, N * NP, vec_size, 1, 0, 0>(nullptr,
-                                                                 l_recv_ptr,
-                                                                 nullptr,
-                                                                 l_node_send_ptrs,
-                                                                 l_node_send_ptrs,
-                                                                 dummy_kbd,
-                                                                 dummy_cbd,
-                                                                 rem_count,
-                                                                 it);
+                        reduce_base<T, N * NP, vec_size, 1, 0, 0>(nullptr,
+                                                                  l_recv_ptr,
+                                                                  nullptr,
+                                                                  l_node_send_ptrs,
+                                                                  l_node_send_ptrs,
+                                                                  dummy_kbd,
+                                                                  dummy_cbd,
+                                                                  reduction_op,
+                                                                  rem_count,
+                                                                  it);
                     }
                 });
         });
@@ -663,15 +721,16 @@ ccl::event allreduce_large_impl(const void *send_buf,
                 h.parallel_for(
                     sycl::nd_range<1>(kernel_size, work_group_size),
                     [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(work_group_size)]] {
-                        reduce_sum<T, N, vec_size, 1, 0, 0>(nullptr,
-                                                            l_reduce_sum_dst,
-                                                            nullptr,
-                                                            l_work_ptrs,
-                                                            l_work_ptrs,
-                                                            dummy_kbd,
-                                                            dummy_cbd,
-                                                            data_count,
-                                                            it);
+                        reduce_base<T, N, vec_size, 1, 0, 0>(nullptr,
+                                                             l_reduce_sum_dst,
+                                                             nullptr,
+                                                             l_work_ptrs,
+                                                             l_work_ptrs,
+                                                             dummy_kbd,
+                                                             dummy_cbd,
+                                                             reduction_op,
+                                                             data_count,
+                                                             it);
                     });
             });
             // when tmp_buf used, perform chunked allgatherv

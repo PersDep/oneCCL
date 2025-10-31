@@ -1036,7 +1036,7 @@ MPI_Op atl_mpi::atl2mpi_op(atl_reduction_t rtype, MPI_Datatype dtype) {
         case ATL_REDUCTION_PROD: return MPI_PROD;
         case ATL_REDUCTION_MIN: return MPI_MIN;
         case ATL_REDUCTION_MAX: return MPI_MAX;
-        default: printf("unknown reduction type: %d\n", rtype); exit(1);
+        default: CCL_THROW("unknown reduction type: ", static_cast<int>(rtype));
     }
 }
 
